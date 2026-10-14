@@ -4,6 +4,10 @@ A rewrite of [freeXplorer](https://github.com/AlvaroEPena/freeXplorer) that isn'
 
 It was written from public documentation of the file system. No code from any other tool is in it.
 
+![freeXplorer-rs in light mode](screenshots/light.png)
+
+![freeXplorer-rs in dark mode](screenshots/dark.png)
+
 ## Where it is
 
 Still being built. On Windows the window and the command line tool work. Linux works too, tried on Ubuntu under WSL2. macOS hasn't been run at all.
