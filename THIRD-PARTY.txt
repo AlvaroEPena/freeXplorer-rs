@@ -1,0 +1,21 @@
+freeXplorer-rs is licensed under the GNU General Public License version 3 (see LICENSE).
+It uses the following.
+
+WinFsp
+------
+WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+https://github.com/winfsp/winfsp
+
+Mounting on Windows goes through WinFsp, a file system driver that is installed
+separately. It isn't included. The program loads winfsp-x64.dll from wherever WinFsp is
+installed when you mount something.
+
+winfsp-rs
+---------
+The winfsp and winfsp-sys crates (https://github.com/SnowflakePowered/winfsp-rs), which
+are the Rust bindings to WinFsp, are licensed under GPL-3.0. That is why this program is.
+
+Rust crates
+-----------
+The other dependencies listed in Cargo.toml and Cargo.lock keep their own licenses, which
+are MIT and/or Apache-2.0 style licenses.

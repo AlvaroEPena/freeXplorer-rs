@@ -1,0 +1,21 @@
+target/
+
+# disk images and backups made while testing
+*.img
+*.bin
+*.vhd
+*.vhdx
+*.sha256
+*.log
+
+# editors
+.vscode/
+.idea/
+
+# write-ups and notes that stay on my machine
+notes/
+*.md
+!README.md
+
+# release packages
+dist/

@@ -1,0 +1,27 @@
+[package]
+name = "freexplorer-rs-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = "0.4.45"
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "links", "wayland", "x11", "glow"] }
+egui_extras = "0.36.2"
+fx_core = { version = "1.0.0", path = "../fx-core" }
+fx_mount = { version = "1.0.0", path = "../fx-mount" }
+fx_platform = { version = "1.0.0", path = "../fx-platform" }
+rfd = "0.17.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_UI_Shell"] }
+
+[target."cfg(windows)".build-dependencies]
+winfsp = { version = "0.13.1", default-features = false, features = ["delayload"] }
+winresource = "0.1.34"
+

@@ -1,0 +1,19 @@
+[package]
+name = "freexplorer-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono = "0.4.45"
+ctrlc = "3.5.2"
+fx_core = { version = "1.0.0", path = "../fx-core" }
+fx_mount = { version = "1.0.0", path = "../fx-mount" }
+fx_platform = { version = "1.0.0", path = "../fx-platform" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target."cfg(windows)".build-dependencies]
+winfsp = { version = "0.13.1", default-features = false, features = ["delayload"] }

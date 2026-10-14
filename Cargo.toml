@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/fx-core", "crates/fx-platform", "crates/fx-mount", "crates/fx-cli", "crates/fx-gui"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["AlvaroEPena"]
+repository = "https://github.com/AlvaroEPena/freeXplorer-rs"
+
+# panics are left unwinding on purpose: inside a mounted drive a bug in one callback
+# should fail that one request, not take the whole mount down with it
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
