@@ -1,6 +1,6 @@
 # freeXplorer-rs
 
-A rewrite of [freeXplorer](https://github.com/AlvaroEPena/freeXplorer) that isn't stuck on Windows. It reads and writes Xbox 360 hard drives (FATX/XTAF), formats them, backs them up and shows them as a normal drive. It comes as a window and as a small command line program, with nothing to install next to them.
+A rewrite of [freeXplorer](https://github.com/AlvaroEPena/freeXplorer) that isn't stuck on Windows. It reads and writes Xbox 360 hard drives (FATX/XTAF), formats them, backs them up and shows them as a normal drive. It comes as a window and as a small command line program, with no installer.
 
 It was written from public documentation of the file system. No code from any other tool is in it.
 
@@ -30,6 +30,7 @@ The program refuses to write to the disk the computer is running from, and to an
 ## What you need
 
 - Windows 10 or 11, 64-bit, for real drives and mounting. A graphics driver with OpenGL 2 (anything from the last ten years)
+- The [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) (2015-2022, x64). Most PCs have it already. If the program says `VCRUNTIME140.dll` is missing, install it, or run `winget install Microsoft.VCRedist.2015+.x64`
 - [WinFsp](https://winfsp.dev), only for mounting. `winget install WinFsp.WinFsp` installs it, and so does the Install driver button in the window
 - Administrator rights to open a real drive. The window asks for them when it starts (on Linux and macOS start it with sudo)
 - On Linux, FUSE 3 (`sudo apt install fuse3`) for mounting. If it's missing, the Install driver button in the window installs it with apt, dnf, pacman or zypper. For the window, OpenGL and the usual desktop libraries (`libxkbcommon`, `libgl1`, `libegl1`, and the Wayland or X11 ones, which any desktop already has). The Browse buttons use your desktop's file dialog (`xdg-desktop-portal`); without one they do nothing, and you can type the path instead
