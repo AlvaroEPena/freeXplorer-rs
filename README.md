@@ -92,7 +92,7 @@ The programs, `freexplorer-rs` and `freexplorer-rs-gui`, end up in `target/relea
 
 ## Built with
 
-Rust, with a few small crates (`chrono`, `sha2`, `lru`, `thiserror`, `ctrlc`) and, on Windows, `windows-sys` and the [`winfsp`](https://crates.io/crates/winfsp) crate for mounting. WinFsp itself is loaded when you mount and isn't needed otherwise. On Linux and macOS mounting goes through FUSE with the [`fuser`](https://crates.io/crates/fuser) crate.
+Rust, with a few small crates: `chrono`, `sha2`, `lru`, `thiserror`, `getrandom` and `ctrlc` for the core and the command line tool. The window is built with [egui](https://github.com/emilk/egui) through `eframe`, with `egui_extras` and `rfd` for the table and the file dialogs. On Windows, mounting uses `windows-sys` and the [`winfsp`](https://crates.io/crates/winfsp) crate. WinFsp itself is loaded when you mount and isn't needed otherwise. On Linux and macOS, mounting goes through FUSE with the [`fuser`](https://crates.io/crates/fuser) crate, and `libc` and `plist` handle disk details there.
 
 - `crates/fx-core` has the block devices, the FATX volume, the formatter, the Xbox 360 drive layout and backups. It doesn't know which operating system it's on.
 - `crates/fx-platform` finds and opens the real disks.
