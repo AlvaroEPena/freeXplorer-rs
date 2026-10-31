@@ -9,7 +9,9 @@
 //!
 //! Either way the five retail partitions are the same five, and their sizes never change.
 
-use super::mbr::{SECTOR_SIZE, Table};
+use super::mbr::{MAX_LBA, SECTOR_SIZE, Table};
+use crate::error::{Error, Result};
+use crate::fatx::geometry::Geometry;
 use crate::partition::{PartitionFileSystem, PartitionSpec};
 
 /// The system partition, where the kernel and the dashboard live. Every formatted drive has
@@ -105,6 +107,139 @@ pub fn retail(drive_len: u64) -> Vec<PartitionSpec> {
         ));
     }
     specs
+}
+
+/// How the space past E is divided, when a format has to choose.
+///
+/// The console's own limits decide this, not taste. A FATX volume holds at most
+/// `MAX_DATA_CLUSTERS` clusters and the largest cluster a console reads is 64 KB, so one volume
+/// tops out at about 1.9 TB. That is the whole reason the 2 TB drive measured here has two extended
+/// partitions, and an even split of its space gives exactly the two sizes on that drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// One F when the extended space fits in a single volume at the cluster size it needs, F and G
+    /// sharing the space evenly when it doesn't. This reproduces both drives measured here: the
+    /// 250 GB drive gets a single F, the 2 TB one gets F and G.
+    Auto,
+    /// One F from the end of E to the end of the drive, refused when no console could read it.
+    FAll,
+}
+
+impl Layout {
+    pub fn name(self) -> &'static str {
+        match self {
+            Layout::Auto => "auto",
+            Layout::FAll => "f-all",
+        }
+    }
+}
+
+/// Whether one volume can hold this much space at a cluster size a console reads.
+fn one_volume_holds(bytes: u64) -> bool {
+    Geometry::og_holds(bytes, Geometry::pick_sectors_per_cluster_og(bytes))
+}
+
+/// The partitions a format writes on a drive this long.
+///
+/// The five retail partitions always come first and never move. Everything past E is then divided
+/// according to `layout`, and the result is checked against what a console can actually read
+/// before it is handed back, so a plan that comes out of here is a plan that can be written.
+pub fn plan(length: u64, layout: Layout) -> Result<Vec<PartitionSpec>> {
+    let mut specs = retail(length);
+    // E ends exactly where the extended space begins, so a drive shorter than that can't carry the
+    // five partitions at all. The specs above are clamped to the drive, which would hide this.
+    let core_end = EXTENDED_START as u64 * SECTOR_SIZE;
+    if length < core_end {
+        return Err(Error::invalid(
+            "the drive is too small for the five partitions every original Xbox has",
+        ));
+    }
+    specs.retain(|s| s.id != "f" && s.id != "g");
+
+    let start = EXTENDED_START as u64 * SECTOR_SIZE;
+    let sectors = length.saturating_sub(start) / SECTOR_SIZE;
+    if sectors == 0 {
+        return Ok(specs);
+    }
+    let whole = sectors * SECTOR_SIZE;
+
+    // how much space each extended partition gets, as (sectors before it, its own sectors)
+    let chunks: Vec<(u64, u64)> = match layout {
+        Layout::Auto if one_volume_holds(whole) => vec![(0, sectors)],
+        Layout::Auto => {
+            // an even split, which is what the 2 TB drive here carries to the sector
+            let f = sectors / 2;
+            vec![(0, f), (f, sectors - f)]
+        }
+        Layout::FAll => {
+            if !one_volume_holds(whole) {
+                return Err(Error::invalid(
+                    "one F can't cover this drive: no console reads a single volume that large, \
+                     so leave the layout on auto and it splits into F and G",
+                ));
+            }
+            vec![(0, sectors)]
+        }
+    };
+
+    for (slot, (from, count)) in chunks.into_iter().enumerate() {
+        if count > MAX_LBA {
+            return Err(Error::invalid(format!(
+                "{} would need more sectors than a partition table can describe",
+                EXTENDED_NAMES[slot]
+            )));
+        }
+        if !one_volume_holds(count * SECTOR_SIZE) {
+            return Err(Error::invalid(format!(
+                "{} is more than one console can read as a FATX volume",
+                EXTENDED_NAMES[slot]
+            )));
+        }
+        specs.push(spec(
+            EXTENDED_IDS[slot],
+            EXTENDED_NAMES[slot],
+            start + from * SECTOR_SIZE,
+            count * SECTOR_SIZE,
+            length,
+        ));
+    }
+    Ok(specs)
+}
+
+/// The slot order a table is written in: E, C, X, Y, Z, then the extended partitions.
+///
+/// Nothing reads the order back, because the parser sorts by where a partition starts. It exists
+/// because every table measured here is written this way, and matching it costs nothing.
+pub fn slot_order(id: &str) -> usize {
+    match id {
+        "e" => 0,
+        "c" => 1,
+        "x" => 2,
+        "y" => 3,
+        "z" => 4,
+        "f" => 5,
+        "g" => 6,
+        "h" => 7,
+        _ => 8,
+    }
+}
+
+/// The name a table carries for a partition.
+///
+/// These are not ids, and the drives measured here disagree about them, so they are written the
+/// way XBPartitioner writes them and never read back as anything but decoration.
+pub fn table_name(id: &str) -> &'static str {
+    match id {
+        "x" => "XBOX GAME SWAP 1",
+        "y" => "XBOX GAME SWAP 2",
+        "z" => "XBOX GAME SWAP 3",
+        "c" => "XBOX DATA",
+        "e" => "XBOX SHELL",
+        "f" => "XBOX F",
+        "g" => "XBOX G",
+        "h" => "XBOX H",
+        _ => "XBOX I",
+    }
 }
 
 pub fn find<'a>(specs: &'a [PartitionSpec], name: &str) -> Option<&'a PartitionSpec> {

@@ -9,7 +9,7 @@
 //! size here is deliberately the small one.
 
 use crate::device::BlockDevice;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Set on entries that describe a partition that exists.
 pub const IN_USE: u32 = 0x8000_0000;
@@ -47,6 +47,24 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// A slot as a format writes it: the name padded with spaces, the in-use flag set.
+    ///
+    /// A name longer than sixteen bytes is cut, which is what the field is; every name a console
+    /// drive carries fits, and `XBOX GAME SWAP 1` fills it exactly.
+    pub fn new(name: &str, start_lba: u32, size_lba: u32) -> Entry {
+        let mut padded = [0x20u8; 16];
+        for (slot, byte) in padded.iter_mut().zip(name.bytes()) {
+            *slot = byte;
+        }
+        Entry {
+            index: 0,
+            flags: IN_USE,
+            start_lba,
+            size_lba,
+            name: padded,
+        }
+    }
+
     pub fn offset(&self) -> u64 {
         self.start_lba as u64 * SECTOR_SIZE
     }
@@ -143,6 +161,52 @@ impl Table {
         }
         Some(Table { magic, entries })
     }
+}
+
+/// The 432 bytes a table occupies, laid out the way a drive carries them.
+///
+/// An unused slot is sixteen spaces and then sixteen zeroes, which is what the drive measured here
+/// has; the parser skips it because the in-use flag is among the zeroes. A used slot leaves its own
+/// last four bytes zero, and so does the drive.
+pub fn table_bytes(entries: &[Entry]) -> [u8; TABLE_BYTES] {
+    let mut out = [0u8; TABLE_BYTES];
+    out[..16].copy_from_slice(PARTINFO_MAGIC);
+    for slot in 0..ENTRY_COUNT {
+        let at = TABLE_PREFIX + slot * ENTRY_SIZE;
+        out[at..at + 16].fill(0x20);
+    }
+    for (slot, entry) in entries.iter().take(ENTRY_COUNT).enumerate() {
+        let at = TABLE_PREFIX + slot * ENTRY_SIZE;
+        out[at..at + 16].copy_from_slice(&entry.name);
+        out[at + 16..at + 20].copy_from_slice(&(entry.flags | IN_USE).to_le_bytes());
+        out[at + 20..at + 24].copy_from_slice(&entry.start_lba.to_le_bytes());
+        out[at + 24..at + 28].copy_from_slice(&entry.size_lba.to_le_bytes());
+    }
+    out
+}
+
+/// Writes a table into sector zero, and nothing else.
+///
+/// The rest of the sector is read back and written unchanged, so whatever a tool left past the
+/// table survives, and the boot loader from `0x200` on is never in the write at all.
+pub fn write(device: &dyn BlockDevice, entries: &[Entry]) -> Result<()> {
+    if entries.len() > ENTRY_COUNT {
+        return Err(Error::invalid(format!(
+            "a table holds {ENTRY_COUNT} entries, not {}",
+            entries.len()
+        )));
+    }
+    if !device.can_write() {
+        return Err(Error::invalid("the device is read-only"));
+    }
+    let mut sector = [0u8; SECTOR_SIZE as usize];
+    if device.len() >= SECTOR_SIZE {
+        device.read_at(0, &mut sector)?;
+    }
+    sector[..TABLE_BYTES].copy_from_slice(&table_bytes(entries));
+    device.write_at(0, &sector)?;
+    device.flush()?;
+    Ok(())
 }
 
 /// Reads and parses sector zero, without caring whether there really is a table there.

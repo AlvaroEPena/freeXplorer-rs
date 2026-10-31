@@ -4,6 +4,14 @@ pub const SECTOR_SIZE: u64 = 512;
 pub const HEADER_SIZE: u64 = 0x1000;
 pub const MAX_FILE_NAME_LENGTH: usize = 42;
 pub const MAX_DATA_CLUSTERS: u64 = 0x1000_0000;
+/// The most clusters an original Xbox volume may have.
+///
+/// The kernel keeps file information in memory and stops at 2^24, so this — not the 32-bit cluster
+/// number — is what limits a volume, and what makes a large drive into F and G instead of one
+/// partition. See `TODO.md` §3 (T3) for the source.
+pub const MAX_DATA_CLUSTERS_OG: u64 = 0x100_0000;
+/// The largest cluster an original Xbox reads at 64 KB. 128 KB and up are Titan-only sizes.
+pub const MAX_SECTORS_PER_CLUSTER_OG: u32 = 0x80;
 
 /// 16 bit entries below this many clusters, 32 bit from here up
 const FAT16_LIMIT: u64 = 0xFFF0;
@@ -73,6 +81,28 @@ impl Geometry {
             spc *= 2;
         }
         0x80
+    }
+
+    /// Whether an original Xbox can read a volume this long at this cluster size.
+    pub fn og_holds(partition_length: u64, sectors_per_cluster: u32) -> bool {
+        match Self::compute(partition_length, sectors_per_cluster) {
+            Ok(geometry) => geometry.cluster_count as u64 <= MAX_DATA_CLUSTERS_OG,
+            Err(_) => false,
+        }
+    }
+
+    /// The cluster size an original Xbox volume of this length gets: the smallest of 16, 32 and
+    /// 64 KB that keeps it under the 2^24 cap.
+    ///
+    /// 64 KB is where it stops even when that is still too many clusters, because 128 KB and up are
+    /// Titan-only sizes. A partition that can't be read at 64 KB is a partition that has to be
+    /// split, and the caller decides that; this only reports the size to try.
+    pub fn pick_sectors_per_cluster_og(partition_length: u64) -> u32 {
+        let mut spc = 0x20u32;
+        while spc < MAX_SECTORS_PER_CLUSTER_OG && !Self::og_holds(partition_length, spc) {
+            spc *= 2;
+        }
+        spc
     }
 
     pub fn fat_offset(&self) -> u64 {

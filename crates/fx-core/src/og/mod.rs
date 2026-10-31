@@ -5,10 +5,12 @@
 //! Unlike the 360 layout, this one is read off the drive rather than compiled in, because it is
 //! the drive's own table that says how the space past E was divided.
 
+pub mod format;
 pub mod layout;
 pub mod mbr;
 pub mod scanner;
 
-pub use layout::{find, from_table, retail};
+pub use format::{Options, Step, drive, steps, steps_for, verify, volumes};
+pub use layout::{Layout, find, from_table, plan, retail};
 pub use mbr::{Entry, Table};
 pub use scanner::scan;
