@@ -142,6 +142,10 @@ moving files
 formatting
   format <target> (--all | --partitions a,b | --whole) [--label NAME] [--cluster-size 16K]
          [--content-size 100G] [--dry-run] [--yes] [--confirm \"disk 3\"]
+         --layout og lays out an original Xbox drive instead: --all writes its table and every
+         partition, --partitions f reformats one the drive already has, and --og-layout auto|f-all
+         says how the space past E is divided (auto splits it into F and G when one volume can't
+         hold it, which is what a drive over about 1.9 TB needs).
   new-image <file> --size 8G [--partition]     make an empty drive image to practice on
 
 backups (a backup is an exact copy of the whole drive, every partition included)
