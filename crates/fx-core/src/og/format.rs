@@ -67,7 +67,7 @@ pub fn steps_for(specs: &[PartitionSpec], options: &Options) -> Result<Vec<Step>
         if spec.length == 0 {
             continue;
         }
-        if spec.offset / SECTOR_SIZE > MAX_LBA as u64 {
+        if spec.offset / SECTOR_SIZE > MAX_LBA {
             return Err(Error::invalid(format!(
                 "{} starts past what a table can address",
                 spec.name
