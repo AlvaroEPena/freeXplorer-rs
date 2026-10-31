@@ -1,9 +1,13 @@
 //! The windows that stop to ask something.
 
 use eframe::egui::{self, Button, Color32, CornerRadius, Frame, Key, Margin, RichText, Stroke, TextEdit};
+use fx_core::og;
+use fx_core::size;
 
 use crate::app::{App, Modal};
-use crate::model::{BackupForm, CLUSTER_CHOICES, FormatForm, RestoreForm};
+use crate::model::{
+    BackupForm, CLUSTER_CHOICES, FormatForm, FormatTarget, OG_CLUSTER_CHOICES, PartitionChoice, RestoreForm,
+};
 use crate::theme::Palette;
 
 /// What a window decided this frame.
@@ -196,105 +200,11 @@ fn format_window(ctx: &egui::Context, p: &Palette, form: &mut FormatForm) -> Out
         boxed(ui, p.danger_background, p.danger_border, form.warning());
         ui.add_space(12.0);
 
-        if form.show_modes() {
-            if ui.radio(!form.compat_only, "Format the drive").clicked() {
-                form.compat_only = false;
-            }
-            ui.horizontal(|ui| {
-                ui.add_space(22.0);
-                muted(ui, p, "Content and the Xbox 1 Compatibility partition, plus the system partitions if the drive doesn't have them. Tick what you want below.");
-            });
-            if ui
-                .radio(form.compat_only, "Only the Xbox 1 Compatibility partition")
-                .clicked()
-            {
-                form.compat_only = true;
-            }
-            ui.horizontal(|ui| {
-                ui.add_space(22.0);
-                muted(
-                    ui,
-                    p,
-                    "Creates it if the drive hasn't got one, or erases it and makes it again. Nothing else is touched.",
-                );
-            });
-            if form.compat_only {
-                ui.label(RichText::new(form.compat_note()).strong());
-            }
-            ui.add_space(8.0);
-        }
-
-        if form.show_choices() {
-            for choice in &mut form.choices {
-                Frame::new()
-                    .fill(p.card)
-                    .stroke(Stroke::new(1.0, p.border))
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(12, 8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.checkbox(&mut choice.selected, RichText::new(&choice.name).strong());
-                                muted(ui, p, &choice.description);
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                muted(ui, p, &choice.size_text());
-                            });
-                        });
-                    });
-            }
-        }
-
-        if form.show_content_options() {
-            ui.add_space(8.0);
-            egui::Grid::new("format-options")
-                .num_columns(2)
-                .spacing([16.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Cluster size");
-                    egui::ComboBox::from_id_salt("cluster")
-                        .selected_text(CLUSTER_CHOICES[form.cluster].0)
-                        .show_ui(ui, |ui| {
-                            for (i, (text, _)) in CLUSTER_CHOICES.iter().enumerate() {
-                                ui.selectable_value(&mut form.cluster, i, *text);
-                            }
-                        });
-                    ui.end_row();
-
-                    if form.show_choices() {
-                        ui.checkbox(&mut form.limit_content, "Limit Content to (GB)");
-                        ui.add_enabled(
-                            form.limit_content,
-                            TextEdit::singleline(&mut form.content_gigabytes).desired_width(100.0),
-                        );
-                        ui.end_row();
-                    }
-
-                    ui.label("Volume label");
-                    ui.add(
-                        TextEdit::singleline(&mut form.label)
-                            .desired_width(f32::INFINITY)
-                            .char_limit(30),
-                    );
-                    ui.end_row();
-                });
-        }
-        if let Some(problem) = form.content_size_problem() {
-            ui.label(RichText::new(problem).color(p.error));
-        }
-        if let Some(problem) = form.label_problem() {
-            ui.label(RichText::new(problem).color(p.error));
-        }
-
-        if form.show_advanced() {
-            ui.add_space(6.0);
-            ui.collapsing("Advanced", |ui| {
-                ui.checkbox(
-                    &mut form.compat_original_style,
-                    "Format the Xbox 1 Compatibility partition in the original Xbox (little endian) style",
-                );
-            });
+        console_choice(ui, p, form);
+        if form.is_og() {
+            og_body(ui, p, form);
+        } else {
+            xbox360_body(ui, p, form);
         }
 
         let phrase = form.confirmation_phrase();
@@ -314,6 +224,276 @@ fn format_window(ctx: &egui::Context, p: &Palette, form: &mut FormatForm) -> Out
         outcome = Outcome::Cancel;
     }
     outcome
+}
+
+/// A drive with no console layout on it could be either. One that already scans as an original
+/// Xbox or a 360 drive has its answer, so the choice is only shown when it means something.
+fn console_choice(ui: &mut egui::Ui, p: &Palette, form: &mut FormatForm) {
+    if !form.can_choose_console() {
+        return;
+    }
+    ui.label(RichText::new("What this drive is for").strong());
+    if ui.radio(!form.is_og(), "Xbox 360").clicked() {
+        form.choose_console(FormatTarget::Xbox360);
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(22.0);
+        muted(
+            ui,
+            p,
+            "Content, the Xbox 1 Compatibility partition and the system partitions.",
+        );
+    });
+    if ui.radio(form.is_og(), "Original Xbox").clicked() {
+        form.choose_console(FormatTarget::Og);
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(22.0);
+        muted(
+            ui,
+            p,
+            "X, Y, Z, C, E, then F and G for the rest of the drive.",
+        );
+    });
+    ui.add_space(10.0);
+}
+
+fn xbox360_body(ui: &mut egui::Ui, p: &Palette, form: &mut FormatForm) {
+    if form.show_modes() {
+        if ui.radio(!form.compat_only, "Format the drive").clicked() {
+            form.compat_only = false;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            muted(ui, p, "Content and the Xbox 1 Compatibility partition, plus the system partitions if the drive doesn't have them. Tick what you want below.");
+        });
+        if ui
+            .radio(form.compat_only, "Only the Xbox 1 Compatibility partition")
+            .clicked()
+        {
+            form.compat_only = true;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            muted(
+                ui,
+                p,
+                "Creates it if the drive hasn't got one, or erases it and makes it again. Nothing else is touched.",
+            );
+        });
+        if form.compat_only {
+            ui.label(RichText::new(form.compat_note()).strong());
+        }
+        ui.add_space(8.0);
+    }
+
+    if form.show_choices() {
+        for choice in &mut form.choices {
+            partition_card(ui, p, choice);
+        }
+    }
+
+    if form.show_content_options() {
+        ui.add_space(8.0);
+        egui::Grid::new("format-options")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Cluster size");
+                egui::ComboBox::from_id_salt("cluster")
+                    .selected_text(CLUSTER_CHOICES[form.cluster].0)
+                    .show_ui(ui, |ui| {
+                        for (i, (text, _)) in CLUSTER_CHOICES.iter().enumerate() {
+                            ui.selectable_value(&mut form.cluster, i, *text);
+                        }
+                    });
+                ui.end_row();
+
+                if form.show_choices() {
+                    ui.checkbox(&mut form.limit_content, "Limit Content to (GB)");
+                    ui.add_enabled(
+                        form.limit_content,
+                        TextEdit::singleline(&mut form.content_gigabytes).desired_width(100.0),
+                    );
+                    ui.end_row();
+                }
+
+                ui.label("Volume label");
+                ui.add(
+                    TextEdit::singleline(&mut form.label)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(30),
+                );
+                ui.end_row();
+            });
+    }
+    if let Some(problem) = form.content_size_problem() {
+        ui.label(RichText::new(problem).color(p.error));
+    }
+    if let Some(problem) = form.label_problem() {
+        ui.label(RichText::new(problem).color(p.error));
+    }
+
+    if form.show_advanced() {
+        ui.add_space(6.0);
+        ui.collapsing("Advanced", |ui| {
+            ui.checkbox(
+                &mut form.compat_original_style,
+                "Format the Xbox 1 Compatibility partition in the original Xbox (little endian) style",
+            );
+        });
+    }
+}
+
+/// The original Xbox window: lay the whole drive out again, or reformat the partitions it already
+/// has where they are.
+fn og_body(ui: &mut egui::Ui, p: &Palette, form: &mut FormatForm) {
+    if form.can_reformat_in_place() {
+        if ui.radio(form.og_relayout, "Lay the drive out again").clicked() {
+            form.og_relayout = true;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            muted(ui, p, "Writes the partition table in sector 0 and makes every partition empty. The boot loader at the start of the drive is left alone.");
+        });
+        if ui.radio(!form.og_relayout, "Only the partitions I tick").clicked() {
+            form.og_relayout = false;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            muted(ui, p, "Sector 0 and the partitions you don't tick stay exactly as they are.");
+        });
+    } else {
+        muted(
+            ui,
+            p,
+            "This drive has no partition table yet, so it has to be laid out from scratch.",
+        );
+    }
+    ui.add_space(10.0);
+
+    if form.og_relayout {
+        ui.label(RichText::new("Space past E").strong());
+        if ui
+            .radio(
+                form.og_layout == og::Layout::Auto,
+                "One F, or F and G when one volume can't hold the drive",
+            )
+            .clicked()
+        {
+            form.og_layout = og::Layout::Auto;
+        }
+        if form.f_all_holds() {
+            if ui
+                .radio(form.og_layout == og::Layout::FAll, "Put it all in one F")
+                .clicked()
+            {
+                form.og_layout = og::Layout::FAll;
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                muted(
+                    ui,
+                    p,
+                    "Too big for one F: no console reads a single volume that large, so it is split into F and G.",
+                );
+            });
+        }
+        ui.add_space(10.0);
+
+        match form.og_steps() {
+            Ok(steps) => {
+                for step in &steps {
+                    let description = format!(
+                        "LBA 0x{:X}, {} KB clusters, FAT{}",
+                        step.spec.offset / og::mbr::SECTOR_SIZE,
+                        step.geometry.cluster_size / 1024,
+                        step.geometry.fat_entry_size * 8
+                    );
+                    plan_row(ui, p, step.spec.name, &description, &size::format(step.spec.length));
+                }
+            }
+            Err(why) => {
+                ui.label(RichText::new(why).color(p.error));
+            }
+        }
+    } else {
+        for choice in &mut form.choices {
+            partition_card(ui, p, choice);
+        }
+    }
+
+    ui.add_space(8.0);
+    egui::Grid::new("og-format-options")
+        .num_columns(2)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("Cluster size");
+            egui::ComboBox::from_id_salt("og-cluster")
+                .selected_text(OG_CLUSTER_CHOICES[form.cluster].0)
+                .show_ui(ui, |ui| {
+                    for (i, (text, _)) in OG_CLUSTER_CHOICES.iter().enumerate() {
+                        ui.selectable_value(&mut form.cluster, i, *text);
+                    }
+                });
+            ui.end_row();
+
+            if form.og_label_applies() {
+                ui.label("Volume label");
+                ui.add(
+                    TextEdit::singleline(&mut form.label)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(15),
+                );
+                ui.end_row();
+            }
+        });
+    if let Some(problem) = form.label_problem() {
+        ui.label(RichText::new(problem).color(p.error));
+    }
+}
+
+fn partition_card(ui: &mut egui::Ui, p: &Palette, choice: &mut PartitionChoice) {
+    Frame::new()
+        .fill(p.card)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut choice.selected, RichText::new(&choice.name).strong());
+                    muted(ui, p, &choice.description);
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    muted(ui, p, &choice.size_text());
+                });
+            });
+        });
+}
+
+/// One line of a layout the window is about to write, with nothing to tick: it is the plan, not a
+/// choice.
+fn plan_row(ui: &mut egui::Ui, p: &Palette, name: &str, description: &str, size: &str) {
+    Frame::new()
+        .fill(p.card)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(name).strong());
+                    muted(ui, p, description);
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    muted(ui, p, size);
+                });
+            });
+        });
 }
 
 fn backup_window(ctx: &egui::Context, p: &Palette, form: &mut BackupForm) -> Outcome {

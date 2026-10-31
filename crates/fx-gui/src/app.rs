@@ -903,6 +903,7 @@ impl App {
             title: source.title.clone(),
             disk: source.disk.clone(),
             layout_fits: length >= layout::MINIMUM_DRIVE_LENGTH,
+            has_table: loaded.has_table,
             scan: loaded.scan,
         };
         self.modal = Some(Modal::Format {
