@@ -197,7 +197,11 @@ fn format_window(ctx: &egui::Context, p: &Palette, form: &mut FormatForm) -> Out
     dialog(ctx, p, 520.0, |ui| {
         heading(ui, &form.heading());
         ui.add_space(10.0);
-        boxed(ui, p.danger_background, p.danger_border, form.warning());
+        boxed(ui, p.danger_background, p.danger_border, &form.warning());
+        if let Some(why) = form.write_blocked() {
+            ui.add_space(8.0);
+            ui.label(RichText::new(why).color(p.error));
+        }
         ui.add_space(12.0);
 
         console_choice(ui, p, form);
@@ -363,14 +367,9 @@ fn og_body(ui: &mut egui::Ui, p: &Palette, form: &mut FormatForm) {
             ui.add_space(22.0);
             muted(ui, p, "Sector 0 and the partitions you don't tick stay exactly as they are.");
         });
-    } else {
-        muted(
-            ui,
-            p,
-            "This drive has no partition table yet, so it has to be laid out from scratch.",
-        );
+        ui.add_space(10.0);
     }
-    ui.add_space(10.0);
+    // a drive with no table has no choice to offer, and the warning at the top already says why
 
     if form.og_relayout {
         ui.label(RichText::new("Space past E").strong());

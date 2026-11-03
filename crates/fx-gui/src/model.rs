@@ -49,6 +49,8 @@ impl SourceRow {
             subtitle: format!("{model}  ·  {}  ·  {}", size::format(disk.length), disk.bus),
             note: if disk.is_system {
                 Some("This computer is running from this disk".into())
+            } else if let Some(state) = disk.write_state() {
+                Some(format!("The system has this disk {state}"))
             } else if disk.has_volumes {
                 Some("Has file systems mounted, probably a PC disk".into())
             } else {
@@ -449,20 +451,31 @@ impl FormatForm {
         }
     }
 
-    pub fn warning(&self) -> &'static str {
+    pub fn warning(&self) -> String {
         if self.og_chosen {
             if self.og_relayout {
-                "The partition table and every partition will be erased and made again. The boot loader at the start of the drive is left exactly as it is."
+                // a drive with no table has only one way to be formatted, so the reason belongs in
+                // the same sentence as the consequence rather than in a line of its own below it
+                if self.info.has_table {
+                    "The partition table and every partition will be erased and made again. The boot loader at the start of the drive is left exactly as it is.".into()
+                } else {
+                    "This drive has no partition table, so it has to be laid out from scratch: the partition table and every partition will be erased and made again. The boot loader at the start of the drive is left exactly as it is.".into()
+                }
             } else {
-                "Everything in the partitions you tick will be erased. The partition table, the other partitions and the boot loader are left as they are."
+                "Everything in the partitions you tick will be erased. The partition table, the other partitions and the boot loader are left as they are.".into()
             }
         } else if self.whole_image {
-            "The whole image will be erased and turned into one empty FATX volume."
+            "The whole image will be erased and turned into one empty FATX volume.".into()
         } else if self.compat_only {
-            "Only the Xbox 1 Compatibility partition is touched. Everything else on the drive stays as it is, and so does its security sector."
+            "Only the Xbox 1 Compatibility partition is touched. Everything else on the drive stays as it is, and so does its security sector.".into()
         } else {
-            "Everything on the partitions you tick will be erased. Other partitions are left alone, and so is the drive's security sector."
+            "Everything on the partitions you tick will be erased. Other partitions are left alone, and so is the drive's security sector.".into()
         }
+    }
+
+    /// Why the system will refuse to write to this disk, if it will.
+    pub fn write_blocked(&self) -> Option<String> {
+        self.info.disk.as_ref().and_then(DiskInfo::write_blocked)
     }
 
     pub fn label_problem(&self) -> Option<&'static str> {
@@ -533,6 +546,11 @@ impl FormatForm {
     }
 
     pub fn can_format(&self) -> bool {
+        // nothing can be written to a disk the system has marked read-only, and the failure the
+        // first write gives back names the wrong cause
+        if self.write_blocked().is_some() {
+            return false;
+        }
         if !self
             .confirm
             .trim()
@@ -1050,6 +1068,16 @@ mod tests {
             removable: true,
             has_volumes: volumes,
             is_system: system,
+            is_read_only: false,
+            is_offline: false,
+        }
+    }
+
+    /// A disk Windows has marked read-only, which is what it does whenever it takes one offline.
+    fn protected_disk(id: &str, length: u64) -> DiskInfo {
+        DiskInfo {
+            is_read_only: true,
+            ..disk(id, length, false, false)
         }
     }
 
@@ -1113,6 +1141,44 @@ mod tests {
         );
         assert!(SourceRow::from_disk(&disk("2", 1 << 30, false, true)).note.is_some());
         assert!(SourceRow::from_disk(&disk("4", 1 << 30, false, false)).note.is_none());
+    }
+
+    /// The state disk 1 was in when the first format attempt failed: nothing on the row said the
+    /// system would refuse every write, so the failure arrived as "the media is write protected".
+    #[test]
+    fn a_read_only_disk_says_so_before_a_format_is_asked_for() {
+        let row = SourceRow::from_disk(&protected_disk("1", 250_000_000_000));
+        assert_eq!(row.note.as_deref(), Some("The system has this disk read-only"));
+    }
+
+    /// The reason and the consequence are one sentence in the warning box, not a red box followed
+    /// by a grey line somewhere below it.
+    #[test]
+    fn a_drive_with_no_table_says_why_it_has_to_be_laid_out() {
+        let form = og_form(250_000_000_000, false);
+        assert!(!form.can_reformat_in_place());
+        let warning = form.warning();
+        assert!(warning.contains("no partition table"), "{warning}");
+        assert!(warning.contains("every partition will be erased"), "{warning}");
+    }
+
+    #[test]
+    fn a_drive_with_a_table_is_not_told_it_has_none() {
+        let form = og_form(250_000_000_000, true);
+        assert!(form.can_reformat_in_place());
+        assert!(!form.warning().contains("no partition table"));
+    }
+
+    #[test]
+    fn a_read_only_disk_refuses_the_format_instead_of_failing_on_the_first_write() {
+        let mut form = og_form(250_000_000_000, true);
+        form.confirm = "disk 3".into();
+        form.og_relayout = true;
+        assert!(form.can_format());
+        form.info.disk = Some(protected_disk("3", 250_000_000_000));
+        assert!(!form.can_format());
+        let why = form.write_blocked().expect("a read-only disk is blocked");
+        assert!(why.contains("read-only"), "{why}");
     }
 
     #[test]
