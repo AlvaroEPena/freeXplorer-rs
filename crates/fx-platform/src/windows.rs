@@ -26,6 +26,9 @@ use crate::raw::open_raw;
 
 const SHARE_ALL: u32 = 7;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
+const IOCTL_DISK_GET_DISK_ATTRIBUTES: u32 = 0x0007_00F0;
+const DISK_ATTRIBUTE_OFFLINE: u64 = 0x1;
+const DISK_ATTRIBUTE_READ_ONLY: u64 = 0x2;
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
 const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
 const DRIVE_REMOVABLE: u32 = 2;
@@ -36,6 +39,29 @@ const MAX_DISKS: u32 = 32;
 
 fn physical_path(number: u32) -> String {
     format!(r"\\.\PhysicalDrive{number}")
+}
+
+/// The two flags the system keeps about a disk: offline, and read-only.
+///
+/// Asked of the disk itself rather than inferred from a failed write. It is deliberately not
+/// `IOCTL_DISK_IS_WRITABLE` either: that one also fails for a process without write access, so it
+/// would report every disk as read-only whenever the window isn't elevated.
+fn disk_attributes(file: &File) -> (bool, bool) {
+    // GET_DISK_ATTRIBUTES is Version, Reserved1, then an eight byte Attributes, and Version has to
+    // be the size of the whole struct.
+    let mut query = [0u8; 16];
+    query[..4].copy_from_slice(&16u32.to_le_bytes());
+    let Some(out) = ioctl(file, IOCTL_DISK_GET_DISK_ATTRIBUTES, &query, 16) else {
+        return (false, false);
+    };
+    if out.len() < 16 {
+        return (false, false);
+    }
+    let attributes = u64::from_le_bytes(out[8..16].try_into().unwrap());
+    (
+        attributes & DISK_ATTRIBUTE_OFFLINE != 0,
+        attributes & DISK_ATTRIBUTE_READ_ONLY != 0,
+    )
 }
 
 pub fn normalize_id(rest: &str) -> Option<String> {
@@ -197,6 +223,7 @@ pub fn list_disks() -> Vec<DiskInfo> {
             bus = bus_name(u32_at(&d, 28));
         }
 
+        let (is_offline, is_read_only) = disk_attributes(&handle);
         disks.push(DiskInfo {
             id: number.to_string(),
             path,
@@ -208,6 +235,8 @@ pub fn list_disks() -> Vec<DiskInfo> {
             removable,
             has_volumes: with_volumes.contains(&number),
             is_system: system.contains(&number),
+            is_read_only,
+            is_offline,
         });
     }
     disks
@@ -228,6 +257,10 @@ pub fn open_disk(disk: &DiskInfo, writable: bool) -> io::Result<Device> {
             "Disk {} is a different drive now. It was {} bytes when the list was loaded and it is {} bytes now.",
             disk.id, disk.length, now.length
         )));
+    }
+    // the write would fail with "the media is write protected", which names the wrong thing
+    if writable && let Some(why) = now.write_blocked() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
     }
     open_raw(
         &now.path,

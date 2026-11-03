@@ -62,6 +62,11 @@ pub struct DiskInfo {
     pub has_volumes: bool,
     /// the disk the operating system is running from
     pub is_system: bool,
+    /// The system has this disk marked read-only, so every write to it fails with "the media is
+    /// write protected". That reads like a switch on the drive and is a flag about it.
+    pub is_read_only: bool,
+    /// The system has taken this disk offline, which also marks it read-only.
+    pub is_offline: bool,
 }
 
 impl DiskInfo {
@@ -79,6 +84,44 @@ impl DiskInfo {
             self.bus
         )
     }
+
+    /// "offline" or "read-only", when the system will refuse to write to this disk.
+    pub fn write_state(&self) -> Option<&'static str> {
+        match (self.is_offline, self.is_read_only) {
+            (false, false) => None,
+            (true, _) => Some("offline"),
+            (false, true) => Some("read-only"),
+        }
+    }
+
+    /// Why the system will refuse a write, and what to do about it.
+    ///
+    /// Windows marks a disk read-only whenever it takes it offline, and the first write then fails
+    /// with "the media is write protected" — which sounds like a switch on the drive and is not
+    /// one. Saying so before a format starts is the difference between a mystery and a command.
+    pub fn write_blocked(&self) -> Option<String> {
+        let state = self.write_state()?;
+        let mut text = format!("This disk is marked {state}, so nothing can be written to it.");
+        if let Some(hint) = unblock_hint(&self.id) {
+            text.push(' ');
+            text.push_str(&hint);
+        }
+        Some(text)
+    }
+}
+
+/// The command that puts a disk back the way it was, where the system has one.
+#[cfg(windows)]
+fn unblock_hint(id: &str) -> Option<String> {
+    Some(format!(
+        "In an elevated prompt: Set-Disk -Number {id} -IsOffline $false, then \
+         Set-Disk -Number {id} -IsReadOnly $false."
+    ))
+}
+
+#[cfg(not(windows))]
+fn unblock_hint(_id: &str) -> Option<String> {
+    None
 }
 
 /// Reads "disk:3", or whatever else this OS calls a disk by (\\.\PhysicalDrive3, /dev/sdb).
@@ -197,5 +240,53 @@ impl KeepAwake {
         KeepAwake {
             _request: sys::Awake::new(reason),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disk(offline: bool, read_only: bool) -> DiskInfo {
+        DiskInfo {
+            id: "1".into(),
+            path: String::new(),
+            length: 250_000_000_000,
+            sector_size: 512,
+            model: "ST3250310NS".into(),
+            serial: String::new(),
+            bus: "USB".into(),
+            removable: true,
+            has_volumes: false,
+            is_system: false,
+            is_read_only: read_only,
+            is_offline: offline,
+        }
+    }
+
+    #[test]
+    fn a_disk_that_can_be_written_says_nothing() {
+        assert!(disk(false, false).write_state().is_none());
+        assert!(disk(false, false).write_blocked().is_none());
+    }
+
+    /// The exact state disk 1 was in: offline, and read-only because of it. The message has to name
+    /// the flag, because "the media is write protected" names neither the flag nor the command.
+    #[test]
+    fn an_offline_disk_is_called_offline_rather_than_protected_media() {
+        let why = disk(true, true).write_blocked().expect("offline blocks writes");
+        assert!(why.contains("offline"), "{why}");
+        assert!(!why.contains("write protected"), "{why}");
+    }
+
+    #[test]
+    fn a_read_only_disk_gets_the_command_that_clears_it() {
+        let why = disk(false, true).write_blocked().expect("read-only blocks writes");
+        assert!(why.contains("read-only"), "{why}");
+        #[cfg(windows)]
+        assert!(
+            why.contains("Set-Disk -Number 1 -IsReadOnly $false"),
+            "{why}"
+        );
     }
 }

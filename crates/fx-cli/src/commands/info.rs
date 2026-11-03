@@ -20,6 +20,10 @@ pub fn list(args: &[String], ctx: &mut Context) -> Outcome {
     for d in &disks {
         let note = if d.is_system {
             "  [system disk]"
+        } else if d.is_offline {
+            "  [offline, read-only]"
+        } else if d.is_read_only {
+            "  [read-only]"
         } else if d.has_volumes {
             "  [has file systems mounted]"
         } else {
