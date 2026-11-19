@@ -5,16 +5,18 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use fx_core::copy::Cancel;
+use fx_core::scan::DriveKind;
 use fx_core::xbox360::layout;
+use fx_core::xbox360::scanner::DetectedPartition;
 use fx_platform::{DiskInfo, safety};
 
 use crate::jobs::{self, Msg, Reporter};
 use crate::model::{
-    BackupForm, FormatForm, FormatInfo, Loaded, MountState, PartRow, RestoreForm, SourceKind, SourceRow,
-    suggested_backup_name,
+    BackupForm, BackupRequest, CheckState, FormatForm, FormatInfo, FormatRequest, Loaded, MountState, PartRow,
+    RestoreForm, RestoreRequest, SourceKind, SourceRow, suggested_backup_name,
 };
 use crate::theme::{self, Palette};
-use crate::{settings, ui};
+use crate::{logging, settings, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverState {
@@ -24,10 +26,24 @@ pub enum DriverState {
     RestartNeeded,
 }
 
-/// Something to do once the current job has finished.
-enum Next {
-    Load(String),
+/// Something that wants the drive to itself, held in one queue so that nothing opens a device
+/// while something else still has it.
+///
+/// Two things can hold a drive: a `run` job, and the background check of a drive that was just
+/// read. Everything else waits here until both have let go. That is not politeness — AGENTS.md is
+/// explicit that two readers on one marginal USB drive will wedge it, and a format or a fix that
+/// lands while a check is mid-walk is worse than a stall.
+enum Pending {
     Refresh,
+    Load(String),
+    /// The background pass over a drive that was just read.
+    Check(String),
+    CheckPart(SourceRow, DetectedPartition),
+    Fix(SourceRow, DetectedPartition),
+    Mount(SourceRow, DetectedPartition, bool),
+    Format(SourceRow, FormatRequest),
+    Backup(SourceRow, DiskInfo, BackupRequest),
+    Restore(RestoreRequest),
 }
 
 /// What a yes to a question leads to.
@@ -67,6 +83,9 @@ pub struct App {
     pub allow_writing: bool,
 
     job: Option<Running>,
+    /// Cancels the background check of the drive that was just read. `Some` means a pass may still
+    /// be holding the drive open, so anything that wants the drive waits in `queue`.
+    checks: Option<Cancel>,
     pub progress: f64,
     pub status: String,
     pub log: VecDeque<String>,
@@ -77,7 +96,7 @@ pub struct App {
     pub dark: bool,
     pub palette: Palette,
 
-    queue: VecDeque<Next>,
+    queue: VecDeque<Pending>,
     last_poll: Instant,
     polling: bool,
     closing_ok: bool,
@@ -99,6 +118,7 @@ impl App {
             mounts: HashMap::new(),
             allow_writing: false,
             job: None,
+            checks: None,
             progress: 0.0,
             status: "Pick a drive on the left, or load a backup.".into(),
             log: VecDeque::new(),
@@ -223,12 +243,66 @@ impl App {
         jobs::spawn(&reporter, work);
     }
 
+    /// Asks for something that wants the drive, and lets go of the background pass first.
+    ///
+    /// The pass is cancelled rather than waited for: it tests the flag per cluster and per
+    /// directory, so it stops in a moment, and blocking the drawing thread until it does would
+    /// freeze the window. `pump` runs the request once the pass says it has finished.
+    fn request(&mut self, next: Pending) {
+        // a pass that is still winding down makes the click look like it did nothing, so say what
+        // is happening rather than leaving the window silent for the second it takes
+        if self.checks.is_some() {
+            self.status = "Waiting for the check to let go of the drive...".into();
+        }
+        self.stop_checks();
+        self.queue.push_back(next);
+        self.pump();
+    }
+
+    /// Runs whatever is waiting for the drive, while nothing holds it. Called when a job finishes
+    /// and when the background pass lets go, so a queued request is never stranded.
+    fn pump(&mut self) {
+        while self.checks.is_none() && !self.busy() {
+            let Some(next) = self.queue.pop_front() else { break };
+            match next {
+                Pending::Refresh => self.refresh_now(),
+                Pending::Load(key) => self.load_now(&key),
+                Pending::Check(key) => self.start_checks(&key),
+                Pending::CheckPart(source, part) => self.check_now(source, part),
+                Pending::Fix(source, part) => self.fix_now(source, part),
+                Pending::Mount(source, part, write) => self.mount_now(source, part, write),
+                Pending::Format(source, request) => {
+                    self.run(false, None, move |r| jobs::format(r, source, request));
+                }
+                Pending::Backup(source, disk, request) => {
+                    self.run(true, None, move |r| jobs::backup(r, source, disk, request));
+                }
+                Pending::Restore(request) => {
+                    self.run(
+                        true,
+                        Some("Stop restoring?\n\nThe drive has only been partly written. It won't work until you restore a backup to it again."),
+                        move |r| jobs::restore(r, request, None),
+                    );
+                }
+            }
+        }
+    }
+
     pub fn refresh(&mut self) {
+        // asking the driver what it is doesn't open a drive, so it needn't wait in the queue
         self.refresh_driver();
+        self.request(Pending::Refresh);
+    }
+
+    fn refresh_now(&mut self) {
         self.run(false, None, jobs::list_disks);
     }
 
     fn load_source(&mut self, key: &str) {
+        self.request(Pending::Load(key.to_string()));
+    }
+
+    fn load_now(&mut self, key: &str) {
         if let Some(source) = self.sources.iter().find(|s| s.key == key).cloned() {
             self.run(false, None, move |r| jobs::read_source(r, source));
         }
@@ -239,18 +313,23 @@ impl App {
     }
 
     fn add_log(&mut self, text: impl AsRef<str>) {
-        self.log.push_back(format!(
-            "{}  {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            text.as_ref()
-        ));
+        let text = text.as_ref();
+        logging::line(text);
+        self.log
+            .push_back(format!("{}  {text}", chrono::Local::now().format("%H:%M:%S")));
         while self.log.len() > 300 {
             self.log.pop_front();
         }
     }
 
     pub fn show_error(&mut self, message: impl Into<String>) {
-        self.modal = Some(Modal::Error(message.into()));
+        let message = message.into();
+        // the dialog is enough for whoever is watching, but the log should say it too, unless
+        // the panel has just written the same thing out
+        if !self.log.back().is_some_and(|last| last.ends_with(&message)) {
+            logging::line(&format!("error: {message}"));
+        }
+        self.modal = Some(Modal::Error(message));
     }
 
     fn confirm(&mut self, title: &str, message: &str, then: Then) {
@@ -278,6 +357,7 @@ impl App {
                 }
             }
             Msg::Log(text) => self.add_log(text),
+            Msg::LogDetail(text) => logging::line(&text),
             Msg::Status(text) => self.status = text,
             Msg::Disks(disks) => self.update_disks(disks),
             Msg::Polled(disks) => {
@@ -288,6 +368,8 @@ impl App {
                 }
             }
             Msg::Loaded { key, result } => self.loaded(key, result),
+            Msg::Checked { key, part_id, result } => self.checked(key, part_id, result),
+            Msg::SideDone => self.side_done(),
             Msg::Mounted { key, part_id, result } => self.mounted(key, part_id, result),
             Msg::Unmounted { key, part_id, result } => {
                 if let Some(source) = self.sources.iter_mut().find(|s| s.key == key)
@@ -309,12 +391,12 @@ impl App {
             }
             Msg::Reload(key) => {
                 if key == "*" {
-                    self.queue.push_back(Next::Refresh);
+                    self.request(Pending::Refresh);
                 } else {
                     if let Some(source) = self.sources.iter_mut().find(|s| s.key == key) {
                         source.loaded = None;
                     }
-                    self.queue.push_back(Next::Load(key));
+                    self.request(Pending::Load(key));
                 }
             }
             Msg::OpenRestore(info) => self.modal = Some(Modal::Restore(Box::new(RestoreForm::new(info)))),
@@ -351,12 +433,8 @@ impl App {
                     self.egui.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
-                if let Some(next) = self.queue.pop_front() {
-                    match next {
-                        Next::Load(key) => self.load_source(&key),
-                        Next::Refresh => self.refresh(),
-                    }
-                }
+                // the drive is free again: anything that was waiting for it can go now
+                self.pump();
             }
         }
     }
@@ -376,7 +454,7 @@ impl App {
         if let Some(key) = keep {
             if let Some(source) = self.sources.iter_mut().find(|s| s.key == key) {
                 source.loaded = None;
-                self.queue.push_back(Next::Load(key));
+                self.queue.push_back(Pending::Load(key));
             } else {
                 self.selected = None;
                 self.selected_part = None;
@@ -406,17 +484,157 @@ impl App {
                         });
                     }
                 }
+                // an original Xbox drive can be carrying space that belongs to no file, and the
+                // partition table alone can never show it, so look while the drive is idle
+                let check_these = loaded.scan.kind == DriveKind::OgDrive;
+                if check_these {
+                    for row in &mut loaded.partitions {
+                        if row.can_mount() && row.mount.is_none() {
+                            row.checking = true;
+                        }
+                    }
+                }
                 if let Some(source) = self.sources.iter_mut().find(|s| s.key == key) {
                     source.loaded = Some(loaded);
                 }
                 if self.selected.as_deref() == Some(key.as_str()) {
                     self.pick_default_partition();
                 }
+                if check_these {
+                    // queued rather than started here: this job still holds the device for a few
+                    // more instructions, and the pass must not open it until the job is done
+                    self.request(Pending::Check(key.clone()));
+                }
             }
             Err(err) => {
                 self.status = err.clone();
                 self.add_log(err);
             }
+        }
+    }
+
+    /// Checks the partitions of the drive that was just read, on a thread of its own. Not a `run`
+    /// job on purpose: the window stays usable and the rows fill in as each answer arrives.
+    ///
+    /// Skipped when a partition on that drive is mounted. A WinFsp mount and a second reader of
+    /// the same raw device wedge each other — AGENTS.md records that costing a whole session, with
+    /// the probe unkillable until the drive was unplugged.
+    fn start_checks(&mut self, key: &str) {
+        if self.mounted_from(key) {
+            return;
+        }
+        let Some(source) = self.sources.iter().find(|s| s.key == key).cloned() else {
+            return;
+        };
+        let Some(loaded) = source.loaded.as_ref() else {
+            return;
+        };
+        let parts: Vec<_> = loaded
+            .partitions
+            .iter()
+            .filter(|p| p.can_mount() && p.mount.is_none())
+            .map(|p| p.detected.clone())
+            .collect();
+        if parts.is_empty() {
+            return;
+        }
+        // say it is happening from the moment it starts, whichever way the pass was reached: a
+        // load, or a request queued behind an earlier pass that had to let go first
+        if let Some(loaded) = self
+            .sources
+            .iter_mut()
+            .find(|s| s.key == key)
+            .and_then(|s| s.loaded.as_mut())
+        {
+            for row in &mut loaded.partitions {
+                if row.can_mount() && row.mount.is_none() {
+                    row.checking = true;
+                }
+            }
+        }
+        let cancel = Cancel::new();
+        self.checks = Some(cancel.clone());
+        let reporter = Reporter::new(self.tx.clone(), self.egui.clone(), cancel);
+        jobs::spawn_side(&reporter, move |r| jobs::check_partitions(r, source, parts));
+    }
+
+    /// Stops the background check, because the user is about to use the drive. The thread may be
+    /// part way through a partition, so `checks` stays set until it says it has finished.
+    ///
+    /// Clearing the "Checking..." marks is part of cancelling, and only of cancelling: a cancelled
+    /// partition never reports back, so nothing else would ever take the marks down. With no pass
+    /// running the marks belong to one that is about to start, and must be left alone.
+    fn stop_checks(&mut self) {
+        let Some(cancel) = self.checks.clone() else {
+            return;
+        };
+        cancel.cancel();
+        for source in &mut self.sources {
+            if let Some(loaded) = &mut source.loaded {
+                for row in &mut loaded.partitions {
+                    row.checking = false;
+                }
+            }
+        }
+    }
+
+    /// The background pass has let go of the drive: run whatever was waiting for it.
+    fn side_done(&mut self) {
+        self.checks = None;
+        // a pass that ended without reporting - cancelled, or caught by the panic guard - would
+        // leave its rows saying "Checking..." for ever
+        for source in &mut self.sources {
+            if let Some(loaded) = &mut source.loaded {
+                for row in &mut loaded.partitions {
+                    row.checking = false;
+                }
+            }
+        }
+        self.pump();
+    }
+
+    fn checked(&mut self, key: String, part_id: String, result: Result<CheckState, String>) {
+        let mut note = None;
+        {
+            let Some(row) = self
+                .sources
+                .iter_mut()
+                .find(|s| s.key == key)
+                .and_then(|s| s.loaded.as_mut())
+                .and_then(|l| l.partitions.iter_mut().find(|p| p.id() == part_id))
+            else {
+                return;
+            };
+            row.checking = false;
+            let name = row.name().to_string();
+            match result {
+                Ok(state) => {
+                    let blocked = state.blocked;
+                    let errors = state.errors;
+                    let reclaimable = state.reclaimable_bytes;
+                    row.check = Some(state);
+                    if blocked {
+                        // the walk never reached the whole tree, so there is nothing a fix could
+                        // release: this is the one verdict that has to be said out loud
+                        note = Some(format!(
+                            "{name}: needs a reformat. The check couldn't read the whole volume, so no amount of fixing will recover it."
+                        ));
+                    } else if errors > 0 {
+                        note = Some(format!(
+                            "{name}: damaged, {errors} errors. Check names them."
+                        ));
+                    } else if reclaimable > 0 {
+                        note = Some(format!(
+                            "{name}: {} belongs to no file. Fix releases it.",
+                            fx_core::size::format(reclaimable)
+                        ));
+                    }
+                }
+                Err(err) => note = Some(format!("{name}: couldn't be checked ({err}).")),
+            }
+        }
+        if let Some(note) = note {
+            self.add_log(note);
         }
     }
 
@@ -452,6 +670,16 @@ impl App {
                     self.status,
                     if read_only { "read-only" } else { "read/write" }
                 ));
+                if read_only {
+                    // say why, so a read-only mount is never a mystery: the only two ways to get
+                    // one here are the box not being ticked, or a device that wouldn't open for
+                    // writing, and the log should tell the two apart
+                    self.add_log(if self.allow_writing {
+                        "The mount is read-only even though writing was turned on: the drive or image wouldn't open for writing."
+                    } else {
+                        "Read-only. Tick \"Allow writing when mounting\", then mount again to change files."
+                    });
+                }
                 fx_platform::open_in_shell(&shell_path(&point));
             }
             Err(err) => {
@@ -545,8 +773,20 @@ impl App {
     }
 
     fn start_mount(&mut self, source: SourceRow, part: PartRow, write: bool) {
-        let detected = part.detected.clone();
-        self.run(false, None, move |r| jobs::mount_one(r, source, detected, write));
+        // queued, because a background check may still be holding the drive open. Two readers on
+        // one drive is what the notes warn about, so the mount waits for the pass to let go.
+        self.request(Pending::Mount(source, part.detected.clone(), write));
+    }
+
+    fn mount_now(&mut self, source: SourceRow, part: DetectedPartition, write: bool) {
+        // record what was asked for: if the result ever comes back read-only, the log then shows
+        // whether this program chose it or the drive did
+        self.add_log(format!(
+            "Mounting {} {}.",
+            part.name(),
+            if write { "read/write" } else { "read-only" }
+        ));
+        self.run(false, None, move |r| jobs::mount_one(r, source, part, write));
     }
 
     pub fn unmount_selected(&mut self) {
@@ -579,8 +819,55 @@ impl App {
         let (Some(source), Some(part)) = (self.selected_source().cloned(), self.selected_partition().cloned()) else {
             return;
         };
-        let detected = part.detected.clone();
-        self.run(false, None, move |r| jobs::check(r, source, detected));
+        self.request(Pending::CheckPart(source, part.detected));
+    }
+
+    /// Starts the check the queue asked for, and marks the row so the list says it is happening.
+    fn check_now(&mut self, source: SourceRow, part: DetectedPartition) {
+        if let Some(row) = self
+            .sources
+            .iter_mut()
+            .find(|s| s.key == source.key)
+            .and_then(|s| s.loaded.as_mut())
+            .and_then(|l| l.partitions.iter_mut().find(|p| p.id() == part.id()))
+        {
+            row.checking = true;
+        }
+        self.run(false, None, move |r| jobs::check(r, source, part));
+    }
+
+    /// Releases space every file already says is free. A mounted partition is refused: its own
+    /// copy of the directory tree is live, and writing the allocation table underneath it would
+    /// corrupt the mount.
+    pub fn fix_selected(&mut self) {
+        let (Some(source), Some(part)) = (self.selected_source().cloned(), self.selected_partition().cloned()) else {
+            return;
+        };
+        if part.is_mounted() {
+            self.show_error("Unmount this partition before fixing it.");
+            return;
+        }
+        // the button is disabled for this, but the refusal belongs in one place too: releasing
+        // space on a volume the check couldn't read is how a real file loses its clusters
+        if part.check.as_ref().is_some_and(|c| c.blocked) {
+            self.show_error(
+                "The check couldn't read this volume completely, so releasing space could cut real files in half. This one needs a reformat.",
+            );
+            return;
+        }
+        if let Some(disk) = &source.disk
+            && let Err(why) = safety::check_write(disk, false)
+        {
+            self.show_error(why);
+            return;
+        }
+        // queued: a fix writes the allocation table, and the background check must not be reading
+        // it when that lands
+        self.request(Pending::Fix(source, part.detected));
+    }
+
+    fn fix_now(&mut self, source: SourceRow, part: DetectedPartition) {
+        self.run(false, None, move |r| jobs::fix(r, source, part));
     }
 
     pub fn format_selected(&mut self) {
@@ -616,6 +903,7 @@ impl App {
             title: source.title.clone(),
             disk: source.disk.clone(),
             layout_fits: length >= layout::MINIMUM_DRIVE_LENGTH,
+            has_table: loaded.has_table,
             scan: loaded.scan,
         };
         self.modal = Some(Modal::Format {
@@ -739,7 +1027,7 @@ impl App {
         ) else {
             return;
         };
-        self.run(false, None, move |r| jobs::format(r, source, request));
+        self.request(Pending::Format(source, request));
     }
 
     pub fn backup_accepted(&mut self, key: String, form: &BackupForm) {
@@ -751,7 +1039,7 @@ impl App {
             return;
         };
         let Some(disk) = source.disk.clone() else { return };
-        self.run(true, None, move |r| jobs::backup(r, source, disk, request));
+        self.request(Pending::Backup(source, disk, request));
     }
 
     pub fn restore_accepted(&mut self, form: &RestoreForm) {
@@ -767,11 +1055,7 @@ impl App {
             self.show_error("Unmount this drive's partitions before restoring a backup to it.");
             return;
         }
-        self.run(
-            true,
-            Some("Stop restoring?\n\nThe drive has only been partly written. It won't work until you restore a backup to it again."),
-            move |r| jobs::restore(r, request, None),
-        );
+        self.request(Pending::Restore(request));
     }
 
     // ---- once per frame ----

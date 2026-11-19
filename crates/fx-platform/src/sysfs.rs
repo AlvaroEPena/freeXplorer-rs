@@ -238,6 +238,9 @@ pub fn list(roots: &Roots) -> Vec<DiskInfo> {
             removable: read(&base.join("removable")).as_deref() == Some("1"),
             has_volumes: usage.busy.contains(&name),
             is_system: usage.system.contains(&name),
+            // the flag is a Windows one; a Linux block device reports write protection on write
+            is_read_only: false,
+            is_offline: false,
             id: name,
         });
     }

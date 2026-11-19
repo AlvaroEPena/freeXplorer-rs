@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-fn file() -> Option<PathBuf> {
+/// The folder this program keeps its own files in: the settings and the log.
+pub fn folder() -> Option<PathBuf> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(target_os = "macos")]
@@ -11,7 +12,11 @@ fn file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-    base.map(|b| b.join("freeXplorer-rs").join("settings.json"))
+    base.map(|b| b.join("freeXplorer-rs"))
+}
+
+fn file() -> Option<PathBuf> {
+    folder().map(|folder| folder.join("settings.json"))
 }
 
 pub fn saved_dark() -> Option<bool> {

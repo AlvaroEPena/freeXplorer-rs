@@ -1,6 +1,7 @@
 use super::name;
 use super::node::NodeId;
 use super::volume::{FatxVolume, MAX_ENTRIES_PER_DIRECTORY};
+use crate::copy::Cancel;
 use crate::error::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,9 +26,21 @@ pub struct FsckReport {
     pub used_clusters: u64,
     pub orphan_clusters: u64,
     pub fixed_clusters: u64,
+    /// Clusters free once the check finished, i.e. counting anything it released.
+    pub free_clusters: u64,
+    /// The cluster size, so the counts above can be turned into bytes.
+    pub bytes_per_cluster: u64,
+    /// The walk stopped part way: the root isn't a directory, a directory couldn't be read, or a
+    /// chain is broken. Releasing space on that walk would cut real files in half, so a fix refuses,
+    /// and the window uses this to say so instead of offering a button that would do nothing.
+    pub incomplete: bool,
 }
 
 impl FsckReport {
+    /// Whether releasing leaked clusters is safe: it is only safe on a volume that was read whole.
+    pub fn fixable(&self) -> bool {
+        !self.incomplete
+    }
     pub fn errors(&self) -> usize {
         self.issues.iter().filter(|i| i.severity == Severity::Error).count()
     }
@@ -38,6 +51,18 @@ impl FsckReport {
 
     pub fn is_clean(&self) -> bool {
         self.errors() == 0 && self.warnings() == 0
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.used_clusters * self.bytes_per_cluster
+    }
+
+    pub fn free_bytes(&self) -> u64 {
+        self.free_clusters * self.bytes_per_cluster
+    }
+
+    pub fn released_bytes(&self) -> u64 {
+        self.fixed_clusters * self.bytes_per_cluster
     }
 
     fn add(&mut self, severity: Severity, message: String) {
@@ -107,7 +132,22 @@ impl FatxVolume {
     /// Walks the whole tree and the whole FAT and reports what doesn't add up. With
     /// `free_orphans` set, clusters that are marked used but that no file owns get released.
     /// It re-reads every directory from disk, so handles handed out earlier are stale afterwards.
-    pub fn check(&mut self, free_orphans: bool, mut status: impl FnMut(&str)) -> Result<FsckReport> {
+    pub fn check(&mut self, free_orphans: bool, status: impl FnMut(&str)) -> Result<FsckReport> {
+        self.check_with(free_orphans, &Cancel::new(), status)
+    }
+
+    /// The same check, but it stops as soon as `cancel` is set and returns `Error::Cancelled`.
+    ///
+    /// A window that checks in the background has to be able to get out of the way when the user
+    /// wants the drive for something else, and the walk is the slow part, so the flag is tested in
+    /// it rather than only between partitions. Nothing is written before the walk finishes, so a
+    /// cancelled `free_orphans` pass leaves the volume untouched.
+    pub fn check_with(
+        &mut self,
+        free_orphans: bool,
+        cancel: &Cancel,
+        mut status: impl FnMut(&str),
+    ) -> Result<FsckReport> {
         let mut report = FsckReport::default();
         let count = self.geometry.cluster_count;
         let mut owned = Owned {
@@ -117,12 +157,28 @@ impl FatxVolume {
 
         let root = self.root;
         let mut pending: Vec<NodeId> = vec![root];
+        report.bytes_per_cluster = self.geometry.cluster_size as u64;
+
+        // Anything that stops the walk part way leaves clusters that a file holds looking like
+        // leaked space, and releasing those would cut the file in half. Track it, so a fix refuses.
+        let mut incomplete = false;
+        if !self.root_looks_sane() {
+            report.add(
+                Severity::Error,
+                "the root cluster doesn't look like a directory, so this volume may be smaller than the partition says"
+                    .to_string(),
+            );
+            incomplete = true;
+        }
+
         let first = self.nodes[root.0].first_cluster;
-        if self.walk("\\", first, &mut owned, &mut report)? < 0 {
+        if self.walk("\\", first, cancel, &mut owned, &mut report)? < 0 {
             pending.clear();
+            incomplete = true;
         }
 
         while let Some(dir) = pending.pop() {
+            cancel.check()?;
             let dir_path = self.path_of(dir);
             status(&dir_path);
             report.directories += 1;
@@ -133,6 +189,7 @@ impl FatxVolume {
                 Ok(children) => children,
                 Err(err @ crate::Error::Fatx { .. }) => {
                     report.add(Severity::Error, format!("{dir_path}: can't read the directory ({err})"));
+                    incomplete = true;
                     continue;
                 }
                 Err(other) => return Err(other),
@@ -165,8 +222,11 @@ impl FatxVolume {
                         report.add(Severity::Error, format!("{path}: directory has no cluster"));
                         continue;
                     }
-                    if self.walk(&path, first_cluster, &mut owned, &mut report)? >= 0 {
+                    if self.walk(&path, first_cluster, cancel, &mut owned, &mut report)? >= 0 {
                         pending.push(child);
+                    } else {
+                        // its contents were never walked, so their clusters all look unowned
+                        incomplete = true;
                     }
                     continue;
                 }
@@ -183,8 +243,10 @@ impl FatxVolume {
                     continue;
                 }
 
-                let have = self.walk(&path, first_cluster, &mut owned, &mut report)?;
+                let have = self.walk(&path, first_cluster, cancel, &mut owned, &mut report)?;
                 if have < 0 {
+                    // the rest of the chain is unknown, so it looks unowned to the sweep below
+                    incomplete = true;
                     continue;
                 }
                 if have < needed {
@@ -204,24 +266,47 @@ impl FatxVolume {
         report.used_clusters = owned.count;
 
         // anything the FAT calls used that nobody owns
-        let fix = free_orphans && !self.read_only;
+        let asked_to_fix = free_orphans && !self.read_only;
+        // releasing on a walk that stopped part way is how a real file loses its clusters
+        let fix = asked_to_fix && !incomplete;
         let mut orphans = 0u64;
+        let mut free = 0u64;
         for c in 1..=count {
-            if owned.test(c) || self.fat.get(c)? == 0 {
+            // the sweep is over the FAT in memory, so it is quick, but a volume with millions of
+            // clusters still gives the user something to wait for
+            if c % 4096 == 0 {
+                cancel.check()?;
+            }
+            if owned.test(c) {
+                continue;
+            }
+            if self.fat.get(c)? == 0 {
+                free += 1;
                 continue;
             }
             orphans += 1;
             if fix {
                 self.set_fat(c, 0)?;
                 report.fixed_clusters += 1;
+                free += 1;
             }
         }
         report.orphan_clusters = orphans;
+        report.free_clusters = free;
+        report.incomplete = incomplete;
         if orphans > 0 {
             let tail = if fix { " (released)" } else { "" };
             report.add(
                 Severity::Warning,
                 format!("{orphans} clusters are marked used but belong to nothing{tail}"),
+            );
+        }
+        if asked_to_fix && incomplete {
+            report.add(
+                Severity::Error,
+                format!(
+                    "nothing was released: the volume couldn't be read completely, so some of those {orphans} clusters may belong to files"
+                ),
             );
         }
         if fix {
@@ -231,11 +316,19 @@ impl FatxVolume {
     }
 
     /// How many clusters the chain has, or -1 if it's broken.
-    fn walk(&mut self, path: &str, first: u32, owned: &mut Owned, report: &mut FsckReport) -> Result<i64> {
+    fn walk(
+        &mut self,
+        path: &str,
+        first: u32,
+        cancel: &Cancel,
+        owned: &mut Owned,
+        report: &mut FsckReport,
+    ) -> Result<i64> {
         let count = self.geometry.cluster_count;
         let mut length = 0i64;
         let mut c = first;
         loop {
+            cancel.check()?;
             if c < 1 || c > count {
                 report.add(
                     Severity::Error,

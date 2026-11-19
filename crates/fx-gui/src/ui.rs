@@ -4,7 +4,7 @@ use eframe::egui::{self, Align, Button, Color32, CornerRadius, Frame, Layout, Ma
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::{App, DriverState};
-use crate::model::SourceKind;
+use crate::model::{drive_kind_label, SourceKind, Tone};
 use crate::theme::{self, Palette};
 
 pub use crate::dialogs::modals;
@@ -71,10 +71,17 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.busy();
     let can_backup = !busy && app.selected_source().is_some_and(|s| s.kind == SourceKind::Disk);
     let part = app.selected_partition();
-    let can_mount = !busy && part.is_some_and(|p| p.can_mount() && !p.is_mounted());
-    let can_unmount = !busy && part.is_some_and(|p| p.is_mounted());
-    let can_open = part.is_some_and(|p| p.is_mounted());
-    let can_check = !busy && part.is_some_and(|p| p.can_mount());
+    // extract booleans we need for button enablement to avoid borrow issues in closures
+    let part_can_mount = part.as_ref().is_some_and(|p| p.can_mount());
+    let part_is_mounted = part.as_ref().is_some_and(|p| p.is_mounted());
+    let part_blocked = part.as_ref().is_some_and(|p| p.check.as_ref().is_some_and(|c| c.blocked));
+    let can_mount = !busy && part_can_mount && !part_is_mounted;
+    let can_unmount = !busy && part_is_mounted;
+    let can_open = part_is_mounted;
+    let can_check = !busy && part_can_mount;
+    // same rule as Check, minus the mounted case: the FAT mustn't change under a live mount
+    // also disabled when the check found the volume couldn't be read completely (blocked)
+    let can_fix = !busy && part_can_mount && !part_is_mounted && !part_blocked;
     let can_format = !busy
         && app
             .selected_source()
@@ -107,7 +114,10 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if ui.add_enabled(can_mount, accent_button("Mount", &p)).clicked() {
+        // the button says which mount you're about to get, because the mode is otherwise only
+        // mentioned afterwards, in the log, by which time it is too late to change it
+        let mount_label = if app.allow_writing { "Mount with writing" } else { "Mount read-only" };
+        if ui.add_enabled(can_mount, accent_button(mount_label, &p)).clicked() {
             app.mount_selected();
         }
         if ui.add_enabled(can_unmount, Button::new("Unmount")).clicked() {
@@ -125,8 +135,25 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         ui.checkbox(&mut app.allow_writing, "Allow writing when mounting");
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // right to left, so the first added sits furthest right: the order below reads
+            // Check, Fix, Format across the bar
             if ui.add_enabled(can_format, Button::new("Format...")).clicked() {
                 app.format_selected();
+            }
+            // Fix is the only button here that writes without a dialog, so it is also the only one
+            // the core has to defend: the volume refuses to release anything it couldn't read fully
+            let fix_button = Button::new("Fix");
+            let fix_response = if part_blocked {
+                ui.add_enabled(can_fix, fix_button).on_hover_text(
+                    "Fix unavailable: the check couldn't read this volume completely.\n\
+                     Releasing space could cut real files in half.\n\
+                     Copy your files off; this one needs a reformat."
+                )
+            } else {
+                ui.add_enabled(can_fix, fix_button)
+            };
+            if fix_response.clicked() {
+                app.fix_selected();
             }
             if ui.add_enabled(can_check, Button::new("Check")).clicked() {
                 app.check_selected();
@@ -174,12 +201,29 @@ fn driver_button(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+/// One line in the list of drives, copied out of the app so the list can be drawn while the rest
+/// of the window holds on to it.
+struct DriveRow {
+    key: String,
+    title: String,
+    /// what the scan made of the drive, once it has been read
+    kind: Option<&'static str>,
+    subtitle: String,
+    note: Option<String>,
+}
+
 fn drives(app: &mut App, ui: &mut egui::Ui) {
     let p = app.palette;
-    let rows: Vec<(String, String, String, Option<String>)> = app
+    let rows: Vec<DriveRow> = app
         .sources
         .iter()
-        .map(|s| (s.key.clone(), s.title.clone(), s.subtitle.clone(), s.note.clone()))
+        .map(|s| DriveRow {
+            key: s.key.clone(),
+            title: s.title.clone(),
+            kind: s.loaded.as_ref().map(|l| drive_kind_label(l.scan.kind)),
+            subtitle: s.subtitle.clone(),
+            note: s.note.clone(),
+        })
         .collect();
     let selected = app.selected.clone();
     let enabled = !app.busy();
@@ -189,7 +233,8 @@ fn drives(app: &mut App, ui: &mut egui::Ui) {
         ui.label(RichText::new("Drives").strong().size(15.0));
         ui.add_space(6.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (key, title, subtitle, note) in rows {
+            for row in rows {
+                let DriveRow { key, title, kind, subtitle, note } = row;
                 let is_selected = selected.as_deref() == Some(key.as_str());
                 let id = ui.make_persistent_id(&key);
                 let fill = if is_selected { p.selected } else { Color32::TRANSPARENT };
@@ -200,6 +245,9 @@ fn drives(app: &mut App, ui: &mut egui::Ui) {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(RichText::new(&title).strong());
+                        if let Some(kind) = kind {
+                            ui.label(RichText::new(kind).color(p.accent).size(12.0));
+                        }
                         ui.label(RichText::new(&subtitle).color(p.muted).size(12.0));
                         if let Some(note) = &note {
                             ui.label(RichText::new(note).color(p.note).size(12.0));
@@ -227,6 +275,10 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
         .selected_source()
         .map(|s| s.title.clone())
         .unwrap_or_else(|| "Partitions".into());
+    let kind = app
+        .selected_source()
+        .and_then(|s| s.loaded.as_ref())
+        .map(|l| drive_kind_label(l.scan.kind));
     let selected = app.selected_part.clone();
     let rows: Vec<_> = app
         .partitions()
@@ -240,13 +292,20 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                 r.offset_text(),
                 r.status(),
                 r.is_mounted(),
+                r.tone(),
+                r.detail().map(str::to_string),
             )
         })
         .collect();
 
     card(&p).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
-        ui.label(RichText::new(title).strong().size(15.0));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).strong().size(15.0));
+            if let Some(kind) = kind {
+                ui.label(RichText::new(kind).color(p.accent).size(13.0));
+            }
+        });
         ui.add_space(6.0);
 
         let mut clicked = None;
@@ -271,7 +330,7 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                 })
                 .body(|body| {
                     body.rows(32.0, rows.len(), |mut row| {
-                        let (id, name, size, format, offset, status, mounted) = &rows[row.index()];
+                        let (id, name, size, format, offset, status, mounted, tone, detail) = &rows[row.index()];
                         let is_selected = selected.as_deref() == Some(id.as_str());
                         let fill = match (*mounted, is_selected) {
                             (true, true) => Some(p.mounted_selected_row),
@@ -279,7 +338,7 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                             (false, true) => Some(p.selected),
                             _ => None,
                         };
-                        for text in [name, size, format, offset, status] {
+                        for (cell, text) in [name, size, format, offset, status].iter().enumerate() {
                             row.col(|ui| {
                                 // each cell paints its own slice of the row, so the bar has no gaps
                                 if let Some(fill) = fill {
@@ -288,7 +347,23 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                                 }
                                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                     ui.add_space(4.0);
-                                    ui.add(egui::Label::new(text).truncate());
+                                    // the status is the only cell that can carry a verdict, so it is
+                                    // the only one drawn in a colour that means something
+                                    let text = match (cell, tone) {
+                                        (4, Some(Tone::Bad)) => RichText::new(text.as_str()).color(p.bad),
+                                        (4, Some(Tone::Warn)) => RichText::new(text.as_str()).color(p.wait),
+                                        (4, Some(Tone::Good)) => RichText::new(text.as_str()).color(p.good),
+                                        _ => RichText::new(text.as_str()),
+                                    };
+                                    let label = ui.add(egui::Label::new(text).truncate());
+                                    // the row stays one short phrase; the reason the check gave up
+                                    // is the answer to "fix it or reformat it", so it must be
+                                    // reachable without opening the report
+                                    if cell == 4
+                                        && let Some(detail) = detail
+                                    {
+                                        let _ = label.on_hover_text(detail);
+                                    }
                                 });
                             });
                         }

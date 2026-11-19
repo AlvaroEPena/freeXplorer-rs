@@ -4,6 +4,7 @@
 mod app;
 mod dialogs;
 mod jobs;
+mod logging;
 mod model;
 mod settings;
 mod theme;
@@ -12,6 +13,14 @@ mod ui;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // a crash before or after the window opens should still leave a message in the log
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logging::line(&format!("panic: {info}"));
+        previous_hook(info);
+    }));
+    logging::started();
+
     #[cfg(windows)]
     if !fx_platform::is_elevated() && !std::env::args().any(|a| a == "--no-elevate") {
         // reading a real drive needs administrator rights, so ask for them once, up front

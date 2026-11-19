@@ -175,7 +175,14 @@ impl FatxFs {
 
     fn add_entry(&self, lock: &DirBufferLock<'_>, entry_name: &str, info: &NodeInfo) -> Result<()> {
         let mut entry = DirInfo::<255>::new();
-        entry.set_name(entry_name)?;
+        // WinFsp measures an entry's name as Size - sizeof(DirInfo), and compares that with
+        // lstrlenW(marker); memfs sets Size from wcslen(name) * 2, i.e. without the terminator.
+        // The crate's set_name counts the terminator, which makes every entry one character too
+        // long: no entry matches its own name as a marker, the search lands on the entry before it,
+        // and the directory is handed out again from that entry for ever. set_name_raw with no
+        // terminator gives the size WinFsp expects; new() has already zeroed the rest of the name.
+        let name: Vec<u16> = entry_name.encode_utf16().collect();
+        entry.set_name_raw(name.as_slice())?;
         self.describe(entry.file_info_mut(), info);
         lock.write(&mut entry)
     }

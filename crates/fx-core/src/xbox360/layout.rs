@@ -28,31 +28,7 @@ pub const CONTENT_ID: &str = "content";
 /// so the part that's really cache stops where SysExt starts
 const SYSTEM_EXT_REGION_LENGTH: u64 = SYSTEM_EXT_LENGTH + SYSTEM_EXT2_LENGTH;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PartitionFileSystem {
-    Fatx,
-    Sfcx,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartitionSpec {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub offset: u64,
-    pub length: u64,
-    pub file_system: PartitionFileSystem,
-    pub description: &'static str,
-}
-
-impl PartitionSpec {
-    pub fn is_fatx(&self) -> bool {
-        self.file_system == PartitionFileSystem::Fatx
-    }
-
-    pub fn end(&self) -> u64 {
-        self.offset + self.length
-    }
-}
+pub use crate::partition::{PartitionFileSystem, PartitionSpec};
 
 /// The console only sees as many sectors as the security sector claims, and that
 /// count is a 32 bit number, so nothing past 2 TiB exists as far as it's concerned.

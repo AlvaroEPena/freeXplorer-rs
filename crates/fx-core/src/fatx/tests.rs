@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::copy::Cancel;
 use crate::device::{BlockDevice, Device, MemoryDevice, read_vec};
 use crate::error::{Error, ErrorKind};
 use crate::testing::*;
@@ -15,6 +16,13 @@ fn kind<T>(result: crate::Result<T>) -> ErrorKind {
 fn open(device: &Arc<MemoryDevice>) -> FatxVolume {
     let shared: Device = device.clone();
     FatxVolume::open(shared, true).unwrap()
+}
+
+/// How many FAT entries say "in use", which is what a fix changes and nothing else should.
+fn clusters_in_use(volume: &mut FatxVolume) -> u64 {
+    (1..=volume.geometry.cluster_count)
+        .filter(|&c| volume.fat.get(c).unwrap() != 0)
+        .count() as u64
 }
 
 // ---- formatting ----
@@ -787,6 +795,99 @@ fn a_leaked_cluster_is_found_and_released() {
     let fixed = volume.check(true, |_| {}).unwrap();
     assert_eq!(fixed.fixed_clusters, 1);
     assert_clean(&mut volume);
+}
+
+#[test]
+fn a_cut_chain_stops_the_fix_releasing_anything() {
+    let (device, mut volume) = create(8 << 20, 8, Flavor::Xbox);
+    let root = volume.root();
+    let file = volume.create_file(root, "f").unwrap();
+    volume.write(file, 0, &random_bytes(100_000, 1)).unwrap();
+    volume.flush().unwrap();
+
+    // cut the file's chain, and add a genuine leaked cluster beside it: the sweep can't tell the
+    // rest of the file's chain from leaked space, so it must release neither
+    let second = volume.nodes[file.0].map.as_ref().unwrap().cluster_at(1).unwrap();
+    volume.set_fat(second, 0).unwrap();
+    let leaked = volume.geometry.cluster_count - 5;
+    volume.set_fat(leaked, volume.geometry.end_of_chain()).unwrap();
+    volume.flush().unwrap();
+    let mut volume = reopen(&device, volume);
+
+    let before = clusters_in_use(&mut volume);
+    let report = volume.check(true, |_| {}).unwrap();
+    assert_eq!(report.fixed_clusters, 0, "a cut chain must stop the fix");
+    assert!(report.errors() > 0);
+    assert!(
+        report.issues.iter().any(|i| i.message.contains("nothing was released")),
+        "{:?}",
+        report.issues
+    );
+    assert_eq!(clusters_in_use(&mut volume), before, "the FAT must be untouched");
+}
+
+#[test]
+fn a_cancelled_check_stops_and_writes_nothing() {
+    let (device, mut volume) = create(8 << 20, 8, Flavor::Xbox);
+    let root = volume.root();
+    for i in 0..40 {
+        let file = volume.create_file(root, &format!("f{i}")).unwrap();
+        volume.write(file, 0, &random_bytes(20_000, i as u64)).unwrap();
+    }
+    let leaked = volume.geometry.cluster_count - 5;
+    volume.set_fat(leaked, volume.geometry.end_of_chain()).unwrap();
+    volume.flush().unwrap();
+    let mut volume = reopen(&device, volume);
+
+    let before = clusters_in_use(&mut volume);
+    // a background check gets out of the way the moment the user wants the drive, even with a fix
+    // asked for: the walk never finishes, so nothing may be released
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let err = volume.check_with(true, &cancel, |_| {}).unwrap_err();
+    assert!(matches!(err, crate::Error::Cancelled), "{err}");
+    assert_eq!(clusters_in_use(&mut volume), before, "the FAT must be untouched");
+}
+
+#[test]
+fn a_root_that_isnt_a_directory_stops_the_fix_releasing_anything() {
+    let (device, mut volume) = create(8 << 20, 8, Flavor::Xbox);
+    let leaked = volume.geometry.cluster_count - 5;
+    volume.set_fat(leaked, volume.geometry.end_of_chain()).unwrap();
+    volume.flush().unwrap();
+    let mut volume = reopen(&device, volume);
+
+    // what 250GB-B's F looks like: a header and a FAT that agree, and file payload where the
+    // root directory should be
+    let root_cluster = volume.nodes[volume.root.0].first_cluster;
+    let offset = volume.geometry.cluster_offset(root_cluster);
+    volume
+        .device
+        .write_at(offset, &vec![0xAAu8; volume.geometry.cluster_size as usize])
+        .unwrap();
+
+    let report = volume.check(true, |_| {}).unwrap();
+    assert_eq!(report.fixed_clusters, 0);
+    assert_eq!(report.orphan_clusters, 1);
+    assert!(
+        report.issues.iter().any(|i| i.message.contains("root cluster")),
+        "{:?}",
+        report.issues
+    );
+}
+
+#[test]
+fn the_check_reports_free_space_and_a_clean_volume_releases_nothing() {
+    let (_, mut volume) = create_default();
+    let report = volume.check(true, |_| {}).unwrap();
+    assert_eq!(report.fixed_clusters, 0);
+    assert!(report.is_clean());
+    assert_eq!(
+        report.used_clusters + report.orphan_clusters + report.free_clusters,
+        volume.geometry.cluster_count as u64
+    );
+    assert!(report.free_clusters > 0);
+    assert_eq!(report.bytes_per_cluster, volume.geometry.cluster_size as u64);
 }
 
 #[test]

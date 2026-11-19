@@ -44,6 +44,8 @@ mod tests {
             removable: true,
             has_volumes: volumes,
             is_system: system,
+            is_read_only: false,
+            is_offline: false,
         }
     }
 

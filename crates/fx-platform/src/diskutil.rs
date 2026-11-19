@@ -137,6 +137,9 @@ pub fn list(run: Run) -> Vec<DiskInfo> {
                 || flag(&info, "Removable"),
             has_volumes: busy.contains(id),
             is_system: system.contains(id),
+            // the flag is a Windows one; diskutil reports a read-only volume, not a read-only disk
+            is_read_only: false,
+            is_offline: false,
         });
     }
     disks

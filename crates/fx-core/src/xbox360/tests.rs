@@ -56,7 +56,8 @@ fn formatting_everything_then_scanning() {
         .filter(|p| p.can_mount())
         .map(|p| p.id())
         .collect();
-    assert_eq!(mountable, ALL);
+    // listed by name rather than in the order they were formatted
+    assert_eq!(mountable, ["compat", "content", "sysext", "sysext2"]);
 
     let content = scan.partitions.iter().find(|p| p.id() == "content").unwrap();
     assert_eq!(content.length(), 8 * GIB - layout::CONTENT_OFFSET);

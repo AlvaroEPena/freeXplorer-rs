@@ -20,6 +20,10 @@ pub fn list(args: &[String], ctx: &mut Context) -> Outcome {
     for d in &disks {
         let note = if d.is_system {
             "  [system disk]"
+        } else if d.is_offline {
+            "  [offline, read-only]"
+        } else if d.is_read_only {
+            "  [read-only]"
         } else if d.has_volumes {
             "  [has file systems mounted]"
         } else {
@@ -166,14 +170,20 @@ pub fn fsck(args: &[String], ctx: &mut Context) -> Outcome {
     }
     say!(
         ctx,
-        "{} folders, {} files, {} of data, {} clusters in use",
+        "{} folders, {} files, {} of data, {} clusters in use, {} free",
         report.directories,
         report.files,
         size::format(report.file_bytes),
-        report.used_clusters
+        report.used_clusters,
+        size::format(report.free_bytes())
     );
     if report.fixed_clusters > 0 {
-        say!(ctx, "released {} leaked clusters", report.fixed_clusters);
+        say!(
+            ctx,
+            "released {} leaked clusters ({})",
+            report.fixed_clusters,
+            size::format(report.released_bytes())
+        );
     }
 
     if report.errors() > 0 {

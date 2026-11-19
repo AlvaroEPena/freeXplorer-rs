@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use fx_core::device::{Device, FileDevice};
 use fx_core::fatx::FatxVolume;
+use fx_core::og::layout as og_layout;
 use fx_core::xbox360::layout;
 use fx_core::xbox360::scanner::{self, DetectedPartition, DriveKind, DriveScan};
 use fx_platform::{DiskInfo, safety};
@@ -58,9 +59,10 @@ fn device_name(device: &FileDevice) -> String {
 
 pub fn describe(kind: DriveKind) -> &'static str {
     match kind {
+        DriveKind::OgDrive => "Xbox (original) drive",
         DriveKind::Xbox360Drive => "Xbox 360 drive",
         DriveKind::SinglePartition => "single FATX partition image",
-        DriveKind::Unknown => "no Xbox 360 partitions found",
+        DriveKind::Unknown => "no console partitions found",
     }
 }
 
@@ -80,6 +82,10 @@ pub fn pick(scan: &DriveScan, name: Option<&str>) -> Result<DetectedPartition, C
 
     let id = if name.eq_ignore_ascii_case(scanner::SINGLE_PARTITION_ID) {
         scanner::SINGLE_PARTITION_ID.to_string()
+    } else if scan.kind == DriveKind::OgDrive {
+        // an original Xbox drive calls its partitions by their letter, and E is the one people
+        // mean when they say "data", which the 360's aliases would turn into Content
+        og_layout::normalize(name)
     } else {
         layout::normalize(name)
     };
@@ -133,6 +139,9 @@ pub fn split_partition(positional: &[String]) -> (Option<String>, Vec<String>) {
 
 fn is_partition_name(text: &str) -> bool {
     if text.eq_ignore_ascii_case(scanner::SINGLE_PARTITION_ID) {
+        return true;
+    }
+    if og_layout::is_partition_id(text) {
         return true;
     }
     [
